@@ -91,7 +91,10 @@ func (p *Prover) BatchProof(input *pb.InputProver) (*pb.GenBatchProofResponse, e
 func (p *Prover) AggregatedProof(in1, in2 string) (*pb.GenAggregatedProofResponse, error) {
 	req := &pb.AggregatorMessage{
 		Request: &pb.AggregatorMessage_GenAggregatedProofRequest{
-			GenAggregatedProofRequest: &pb.GenAggregatedProofRequest{Input_1: in1, Input_2: in2},
+			GenAggregatedProofRequest: &pb.GenAggregatedProofRequest{
+				RecursiveProof_1: in1,
+				RecursiveProof_2: in2,
+			},
 		},
 	}
 	res, err := p.call(req)
@@ -116,7 +119,7 @@ func (p *Prover) AggregatedProof(in1, in2 string) (*pb.GenAggregatedProofRespons
 func (p *Prover) FinalProof(in string) (*pb.GenFinalProofResponse, error) {
 	req := &pb.AggregatorMessage{
 		Request: &pb.AggregatorMessage_GenFinalProofRequest{
-			GenFinalProofRequest: &pb.GenFinalProofRequest{Input: in},
+			GenFinalProofRequest: &pb.GenFinalProofRequest{RecursiveProof: in},
 		},
 	}
 	res, err := p.call(req)
