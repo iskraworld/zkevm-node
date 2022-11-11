@@ -74,13 +74,15 @@ func (p *Prover) ProveBatch(input *pb.InputProver) (string, error) {
 		return "", err
 	}
 	if msg, ok := res.Response.(*pb.ProverMessage_GenBatchProofResponse); ok {
-		// TODO(pg): handle all cases
 		switch msg.GenBatchProofResponse.Result {
 		case pb.Result_UNSPECIFIED:
+			// TODO(pg): handle this case
 		case pb.Result_OK:
 			return msg.GenBatchProofResponse.Id, nil
 		case pb.Result_ERROR:
+			return "", errors.New("Prover error")
 		case pb.Result_INTERNAL_ERROR:
+			return "", errors.New("Prover internal error")
 		}
 	}
 	return "", errors.New("bad response") // FIXME(pg)
@@ -88,55 +90,59 @@ func (p *Prover) ProveBatch(input *pb.InputProver) (string, error) {
 
 // AggregatedProof instructs the prover to generate an aggregated proof from
 // the two inputs provided. It returns the ID of the proof being computed.
-func (p *Prover) AggregatedProof(in1, in2 string) (*pb.GenAggregatedProofResponse, error) {
+func (p *Prover) AggregatedProof(inputProof1, inputProof2 string) (string, error) {
 	req := &pb.AggregatorMessage{
 		Request: &pb.AggregatorMessage_GenAggregatedProofRequest{
 			GenAggregatedProofRequest: &pb.GenAggregatedProofRequest{
-				RecursiveProof_1: in1,
-				RecursiveProof_2: in2,
+				RecursiveProof_1: inputProof1,
+				RecursiveProof_2: inputProof2,
 			},
 		},
 	}
 	res, err := p.call(req)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	if msg, ok := res.Response.(*pb.ProverMessage_GenAggregatedProofResponse); ok {
-		// TODO(pg): handle all cases
 		switch msg.GenAggregatedProofResponse.Result {
 		case pb.Result_UNSPECIFIED:
+			// TODO(pg): handle this case
 		case pb.Result_OK:
-			return msg.GenAggregatedProofResponse, nil
+			return msg.GenAggregatedProofResponse.Id, nil
 		case pb.Result_ERROR:
+			return "", errors.New("Prover error")
 		case pb.Result_INTERNAL_ERROR:
+			return "", errors.New("Prover internal error")
 		}
 	}
-	return nil, errors.New("bad response") // FIXME(pg)
+	return "", errors.New("bad response") // FIXME(pg)
 }
 
 // FinalProof instructs the prover to generate a final proof for the given
 // input. It returns the ID of the proof being computed.
-func (p *Prover) FinalProof(in string) (*pb.GenFinalProofResponse, error) {
+func (p *Prover) FinalProof(inputProof string) (string, error) {
 	req := &pb.AggregatorMessage{
 		Request: &pb.AggregatorMessage_GenFinalProofRequest{
-			GenFinalProofRequest: &pb.GenFinalProofRequest{RecursiveProof: in},
+			GenFinalProofRequest: &pb.GenFinalProofRequest{RecursiveProof: inputProof},
 		},
 	}
 	res, err := p.call(req)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	if msg, ok := res.Response.(*pb.ProverMessage_GenFinalProofResponse); ok {
-		// TODO(pg): handle all cases
 		switch msg.GenFinalProofResponse.Result {
 		case pb.Result_UNSPECIFIED:
+			// TODO(pg): handle this case
 		case pb.Result_OK:
-			return msg.GenFinalProofResponse, nil
+			return msg.GenFinalProofResponse.Id, nil
 		case pb.Result_ERROR:
+			return "", errors.New("Prover error")
 		case pb.Result_INTERNAL_ERROR:
+			return "", errors.New("Prover internal error")
 		}
 	}
-	return nil, errors.New("bad response") // FIXME(pg)
+	return "", errors.New("bad response") // FIXME(pg)
 }
 
 // CancelProofRequest asks the prover to stop the generation of the proof
@@ -158,7 +164,9 @@ func (p *Prover) CancelProofRequest(proofID string) error {
 		case pb.Result_OK:
 			return nil
 		case pb.Result_ERROR:
+			return errors.New("Prover error")
 		case pb.Result_INTERNAL_ERROR:
+			return errors.New("Prover internal error")
 		}
 	}
 	return errors.New("bad response") // FIXME(pg)
