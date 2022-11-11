@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"time"
 
+	pb2 "github.com/0xPolygonHermez/zkevm-node/aggregator_v2/pb"
 	ethmanTypes "github.com/0xPolygonHermez/zkevm-node/etherman/types"
 	"github.com/0xPolygonHermez/zkevm-node/log"
 	"github.com/0xPolygonHermez/zkevm-node/proverclient/pb"
@@ -85,10 +86,9 @@ func (c *Client) SequenceBatches(ctx context.Context, sequences []ethmanTypes.Se
 			}
 			log.Errorf("tx %s failed, err: %w", tx.Hash(), err)
 			return fmt.Errorf("tx %s failed, err: %w", tx.Hash(), err)
-		} else {
-			log.Infof("sequence sent to L1 successfully. Tx hash: %s", tx.Hash())
-			return nil
 		}
+		log.Infof("sequence sent to L1 successfully. Tx hash: %s", tx.Hash())
+		return nil
 	}
 	return nil
 }
@@ -144,12 +144,16 @@ func (c *Client) VerifyBatch(ctx context.Context, batchNum uint64, resGetProof *
 			}
 			log.Errorf("tx %s failed, err: %w", tx.Hash(), err)
 			return fmt.Errorf("tx %s failed, err: %w", tx.Hash(), err)
-		} else {
-			log.Infof("batch verification sent to L1 successfully. Tx hash: %s", tx.Hash())
-			time.Sleep(c.cfg.FrequencyForResendingFailedVerifyBatch.Duration)
-			return nil
 		}
+		log.Infof("batch verification sent to L1 successfully. Tx hash: %s", tx.Hash())
+		time.Sleep(c.cfg.FrequencyForResendingFailedVerifyBatch.Duration)
+		return nil
 	}
+	return nil
+}
+
+func (c *Client) SendProof(ctx context.Context, resGetProof *pb2.FinalProof) error {
+	log.Error("not implemented")
 	return nil
 }
 

@@ -3,6 +3,7 @@ package aggregator2
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/big"
 	"math/rand"
@@ -10,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/0xPolygonHermez/zkevm-node/aggregator/prover"
 	pb2 "github.com/0xPolygonHermez/zkevm-node/aggregator_v2/pb"
 	prover2 "github.com/0xPolygonHermez/zkevm-node/aggregator_v2/prover"
 	"github.com/0xPolygonHermez/zkevm-node/encoding"
@@ -18,13 +18,13 @@ import (
 	"github.com/0xPolygonHermez/zkevm-node/log"
 	"github.com/0xPolygonHermez/zkevm-node/proverclient/pb"
 	"github.com/0xPolygonHermez/zkevm-node/state"
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/iden3/go-iden3-crypto/keccak256"
+	"github.com/jackc/pgx/v4"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health/grpc_health_v1"
 )
 
-// Aggregator represents an aggregator
+// Aggregator represents an aggregator.
 type Aggregator2 struct {
 	pb2.UnimplementedAggregatorServiceServer
 
@@ -35,23 +35,23 @@ type Aggregator2 struct {
 	Ethman               etherman
 	ProverClients        []proverClientInterface
 	ProfitabilityChecker aggregatorTxProfitabilityChecker
-	TimeSendFinalProof   time.Time
-	StateDBMutex         *sync.Mutex
 
-	srv  *grpc.Server
-	ctx  context.Context
-	exit context.CancelFunc
+	timeSendFinalProof time.Time
+	mu                 *sync.Mutex
+	cutOff             <-chan time.Time
+	srv                *grpc.Server
+	ctx                context.Context
+	exit               context.CancelFunc
 }
 
-// NewAggregator creates a new aggregator
-func NewAggregator2(
+// New creates a new aggregator.
+func New(
 	cfg Config,
 	stateInterface stateInterface,
 	ethTxManager ethTxManager,
 	etherman etherman,
-	grpcClientConns []*grpc.ClientConn,
-) (Aggregator2, error) {
-	var profitabilityChecker aggregatorTxProfitabilityChecker
+) (*Aggregator2, error) {
+	var profitabilityChecker aggregatorTxProfitabilityChecker // FIXME
 	switch cfg.TxProfitabilityCheckerType {
 	case ProfitabilityBase:
 		profitabilityChecker = NewTxProfitabilityCheckerBase(stateInterface, cfg.IntervalAfterWhichBatchConsolidateAnyway.Duration, cfg.TxProfitabilityMinReward.Int)
@@ -59,53 +59,17 @@ func NewAggregator2(
 		profitabilityChecker = NewTxProfitabilityCheckerAcceptAll(stateInterface, cfg.IntervalAfterWhichBatchConsolidateAnyway.Duration)
 	}
 
-	proverClients := make([]proverClientInterface, 0, len(cfg.ProverURIs))
-	//ctx := context.Background()
-
-	a := Aggregator2{
+	a := &Aggregator2{
 		cfg: cfg,
 
 		State:                stateInterface,
 		EthTxManager:         ethTxManager,
 		Ethman:               etherman,
-		ProverClients:        proverClients,
 		ProfitabilityChecker: profitabilityChecker,
-		StateDBMutex:         &sync.Mutex{},
+		mu:                   &sync.Mutex{},
 	}
-
-	rand.Seed(time.Now().UnixNano()) //·
-
-	for _, proverURI := range cfg.ProverURIs {
-		proverClient := prover.NewClient(proverURI, cfg.IntervalFrequencyToGetProofGenerationState)
-		proverClients = append(proverClients, proverClient)
-		grpcClientConns = append(grpcClientConns, proverClient.Prover.Conn)
-		log.Infof("Connected to prover %v", proverURI)
-
-		/*		// Check if prover is already working in a proof generation
-				proof, err := stateInterface.GetWIPProofByProver2(ctx, proverURI, nil)
-				if err != nil && err != state.ErrNotFound {
-					log.Errorf("Error while getting WIP proof for prover %v", proverURI)
-					continue
-				}
-
-				if proof != nil {
-					log.Infof("Resuming WIP proof generation for batchNumber %v in prover %v", proof.BatchNumber, *proof.Prover)
-					go func() {
-						a.resumeWIPProofGeneration(ctx, proof, proverClient)
-					}()
-				}*/
-	}
-
-	a.ProverClients = proverClients
 
 	return a, nil
-}
-
-func (a *Aggregator2) resumeWIPProofGeneration(ctx context.Context, proof *state.Proof2, prover proverClientInterface) {
-	/*	err := a.getAndStoreProof(ctx, proof, prover)
-		if err != nil {
-			log.Warnf("Could not resume WIP Proof Generation for prover %v and batchNumber %v", *proof.Prover, proof.BatchNumber)
-		}*/
 }
 
 // Start starts the aggregator
@@ -117,6 +81,11 @@ func (a *Aggregator2) Start(ctx context.Context) {
 	ctx, cancel = context.WithCancel(ctx)
 	a.ctx = ctx
 	a.exit = cancel
+	a.timeSendFinalProof = time.Now().Add(a.cfg.IntervalToSendFinalProof.Duration)
+
+	ticker := time.NewTicker(a.cfg.IntervalToSendFinalProof.Duration)
+	defer ticker.Stop()
+	a.cutOff = ticker.C
 
 	address := fmt.Sprintf("%s:%d", a.cfg.Host, a.cfg.Port)
 	lis, err := net.Listen("tcp", address)
@@ -138,48 +107,14 @@ func (a *Aggregator2) Start(ctx context.Context) {
 		}
 	}()
 
-	// define those vars here, bcs it can be used in case <-a.ctx.Done()
-	tickerVerifyBatch := time.NewTicker(a.cfg.IntervalToConsolidateState.Duration)
-	tickerSendVerifiedBatch := time.NewTicker(a.cfg.IntervalToSendFinalProof.Duration)
-	defer tickerVerifyBatch.Stop()
-	defer tickerSendVerifiedBatch.Stop()
-
-	a.TimeSendFinalProof = time.Now().Add(a.cfg.IntervalToSendFinalProof.Duration)
-
-	for i := 0; i < len(a.ProverClients); i++ {
-		go func(prover proverClientInterface) {
-			for {
-				if prover.IsIdle(ctx) {
-					proofGenerated, _ := a.tryAggregateProofs(ctx, prover, tickerVerifyBatch)
-					if !proofGenerated {
-						proofGenerated, _ = a.tryGenerateProofs(ctx, prover, tickerVerifyBatch)
-					}
-					if !proofGenerated {
-						// if no proof was generated (aggregated or batch) wait some time waiting before retry
-						time.Sleep(a.cfg.IntervalToConsolidateState.Duration)
-					} // if proof was generated we retry inmediatly as probably we have more proofs to process
-				} else {
-					log.Warn("Prover %s is not idle", prover.GetURI())
-					time.Sleep(a.cfg.IntervalToConsolidateState.Duration)
-				}
-			}
-		}(a.ProverClients[i])
-		time.Sleep(time.Second)
-	}
-
-	go func() {
-		for {
-			//			a.tryToSendVerifiedBatch(ctx, tickerSendVerifiedBatch)
-		}
-	}()
 	// Wait until context is done
 	<-ctx.Done()
 }
 
 // Stop stops the Aggregator server.
 func (a *Aggregator2) Stop() {
-	a.exit()
 	a.srv.Stop()
+	a.exit()
 }
 
 // Channel implements the bi-directional communication channel between the
@@ -193,9 +128,6 @@ func (a *Aggregator2) Channel(stream pb2.AggregatorService_ChannelServer) error 
 
 	ctx := stream.Context()
 
-	tickerVerifyBatch := time.NewTicker(a.cfg.IntervalToConsolidateState.Duration)
-	defer tickerVerifyBatch.Stop()
-
 	go func() {
 		for {
 			select {
@@ -205,18 +137,39 @@ func (a *Aggregator2) Channel(stream pb2.AggregatorService_ChannelServer) error 
 			case <-ctx.Done():
 				// client disconnected
 				return
-			case <-tickerVerifyBatch.C:
-				if prover.IsIdle() {
-					proofGenerated, _ := a.tryAggregateProofs(ctx, prover, tickerVerifyBatch)
-					if !proofGenerated {
-						proofGenerated, _ = a.tryGenerateProofs(ctx, prover, tickerVerifyBatch)
-					}
-					if !proofGenerated {
-						// if no proof was generated (aggregated or batch) wait some time waiting before retry
-						time.Sleep(a.cfg.IntervalToConsolidateState.Duration)
-					} // if proof was generated we retry inmediatly as probably we have more proofs to process
-				} else {
+			case <-a.cutOff:
+				err := a.sendFinalProof(ctx, prover)
+				if err != nil {
+					log.Errorf("failed to send final proof: ", err)
+				}
+				a.exit()
+				return
+			default:
+				if !prover.IsIdle() {
 					log.Warn("Prover ID %s is not idle", prover.ID())
+					time.Sleep(a.cfg.IntervalToConsolidateState.Duration)
+					continue
+				}
+
+				// try to aggregate first
+				proofGenerated, err := a.aggregateProofs(ctx, prover)
+				if err != nil {
+					log.Errorf("failed to aggregate proofs: %w", err)
+					a.exit()
+					return
+				}
+				if !proofGenerated {
+					// nothing to aggregate, try to generate a proof from a batch
+					proofGenerated, err = a.generateProof(ctx, prover)
+					if err != nil {
+						log.Errorf("failed to generate batch proof: %w", err)
+						a.exit()
+						return
+					}
+				}
+				if !proofGenerated {
+					// if proof was generated we retry immediatly as probably we have more proofs to process
+					// if no proof was generated (aggregated or batch) wait some time waiting before retry
 					time.Sleep(a.cfg.IntervalToConsolidateState.Duration)
 				}
 			}
@@ -237,97 +190,68 @@ func (a *Aggregator2) Channel(stream pb2.AggregatorService_ChannelServer) error 
 	}
 }
 
-/*func (a *Aggregator2) tryToSendVerifiedBatch(ctx context.Context, ticker *time.Ticker) {
+func (a *Aggregator2) getAndLockProofToFinalize(ctx context.Context) (*state.Proof2, error) {
+	return nil, nil
+}
+
+func (a *Aggregator2) sendFinalProof(ctx context.Context, prover proverInterface) error {
 	log.Debug("Checking if network is synced")
 	for !a.isSynced(ctx) {
-		log.Infof("Waiting for synchronizer to sync...")
-		waitTick(ctx, ticker)
+		log.Debug("Waiting for synchronizer to sync...")
 		continue
 	}
-	log.Debug("Checking if there is any consolidated batch to be verified")
+
 	lastVerifiedBatch, err := a.State.GetLastVerifiedBatch(ctx, nil)
-	if err != nil && err != state.ErrNotFound {
-		log.Warnf("Failed to get last consolidated batch, err: %v", err)
-		waitTick(ctx, ticker)
-		return
-	} else if err == state.ErrNotFound {
-		log.Debug("No consolidated batch found")
-		waitTick(ctx, ticker)
-		return
+	if errors.Is(err, state.ErrNotFound) {
+		// no verified batches, swallow the error
+		log.Debug("Found no verified batches")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("Failed to get last verified batch: %w", err)
 	}
 
 	batchNumberToVerify := lastVerifiedBatch.BatchNumber + 1
 
-	proof, err := a.State.GetGeneratedProofByBatchNumber(ctx, batchNumberToVerify, nil)
-	if err != nil && err != state.ErrNotFound {
-		log.Warnf("Failed to get last proof for batch %v, err: %v", batchNumberToVerify, err)
-		waitTick(ctx, ticker)
-		return
+	proof, err := a.getAndLockProofToFinalize(ctx)
+	if errors.Is(err, state.ErrNotFound) {
+		// no to finalize, swallow the error
+		log.Debug("Found no proof to finalize")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("Failed to retrieve proof to finalize: %w", err)
 	}
 
-	if proof != nil && proof.Proof != nil {
-		log.Infof("Sending verified proof to the ethereum smart contract, batchNumber %d", batchNumberToVerify)
-		err := a.EthTxManager.VerifyBatch(ctx, batchNumberToVerify, proof.Proof)
-		if err != nil {
-			log.Errorf("Error verifying batch %d, err: %w", batchNumberToVerify, err)
-		} else {
-			log.Infof("Proof for the batch was sent, batchNumber: %v", batchNumberToVerify)
-			err := a.State.DeleteGeneratedProof2(ctx, batchNumberToVerify, batchNumberToVerify, nil)
-			if err != nil {
-				log.Warnf("Failed to delete generated proof for batchNumber %v, err: %v", batchNumberToVerify, err)
-			}
-		}
-	} else {
-		log.Debugf("No generated proof for batchNumber %v has been found", batchNumberToVerify)
-		waitTick(ctx, ticker)
+	if proof.BatchNumber != batchNumberToVerify {
+		log.Infof("Proof batch number %d is not the following to last verfied batch number %d", proof.BatchNumber, batchNumberToVerify)
+		return nil
 	}
-}*/
 
-func (a *Aggregator2) trySendFinalProof(ctx context.Context, proof *state.Proof2, ticker *time.Ticker) (bool, error) {
-	if a.TimeSendFinalProof.Before(time.Now()) {
-		log.Debug("Send final proof time reached")
-
-		log.Debug("Checking if network is synced")
-		for !a.isSynced(ctx) {
-			log.Info("Waiting for synchronizer to sync...")
-			waitTick(ctx, ticker) //·sleep
-			continue
-		}
-
-		lastVerifiedBatch, err := a.State.GetLastVerifiedBatch(ctx, nil)
-		if err != nil && err != state.ErrNotFound {
-			log.Warnf("Failed to get last verified batch, err: %v", err)
-			return false, err
-		} else if err == state.ErrNotFound {
-			log.Debug("Last verified batch not found")
-			return false, err
-		}
-
-		batchNumberToVerify := lastVerifiedBatch.BatchNumber + 1
-
-		if proof.BatchNumber == batchNumberToVerify {
-			//· Calcular la final proof antes de enviarla
-			log.Infof("Generating final proof for batches %d-%d", proof.BatchNumber, proof.BatchNumberFinal)
-
-			log.Infof("Verfiying final proof with ethereum smart contract, batches %d-%d", proof.BatchNumber, proof.BatchNumberFinal)
-			err := a.EthTxManager.VerifyBatch(ctx, proof.BatchNumberFinal, proof.Proof)
-			if err != nil {
-				log.Errorf("Error verifiying final proof for batches %d-%d, err: %w", proof.BatchNumber, proof.BatchNumberFinal, err)
-				return false, err
-			} else {
-				log.Infof("Final proof for batches %d-%d verified", proof.BatchNumber, proof.BatchNumberFinal)
-				a.TimeSendFinalProof = time.Now().Add(a.cfg.IntervalToSendFinalProof.Duration)
-				return true, nil
-			}
-		} else {
-			log.Infof("Proof batch number %d is not the following to last verfied batch number %d", proof.BatchNumber, batchNumberToVerify)
-			return false, nil
-		}
-	} else {
-		return false, nil
+	log.Infof("Generating final proof for batches %d-%d", proof.BatchNumber, proof.BatchNumberFinal)
+	var finalProofID string
+	finalProofID, err = prover.FinalProof(proof.Proof)
+	if err != nil {
+		return fmt.Errorf("Failed to instruct prover to prepare final proof: %w", err)
 	}
+
+	var finalProof *pb2.FinalProof
+	finalProof, err = prover.WaitFinalProof(ctx, finalProofID)
+	if err != nil {
+		return fmt.Errorf("Failed to get final proof: %w", err)
+	}
+
+	log.Infof("Verfiying final proof with ethereum smart contract, batches %d-%d", proof.BatchNumber, proof.BatchNumberFinal)
+	err = a.EthTxManager.SendProof(ctx, finalProof)
+	if err != nil {
+		return fmt.Errorf("Error verifiying final proof for batches %d-%d: %w", proof.BatchNumber, proof.BatchNumberFinal, err)
+	}
+	log.Infof("Final proof for batches %d-%d verified", proof.BatchNumber, proof.BatchNumberFinal)
+
+	return nil
 }
-func (a *Aggregator2) unlockProofsToAggregate(ctx context.Context, proof1 *state.Proof2, proof2 *state.Proof2, ticker *time.Ticker) error {
+
+func (a *Aggregator2) unlockProofsToAggregate(ctx context.Context, proof1 *state.Proof2, proof2 *state.Proof2) error {
 	// Release proofs from aggregating state in a single transaction
 	dbTx, err := a.State.BeginStateTransaction(ctx)
 	if err != nil {
@@ -337,30 +261,30 @@ func (a *Aggregator2) unlockProofsToAggregate(ctx context.Context, proof1 *state
 
 	proof1.Aggregating = false
 	err = a.State.UpdateGeneratedProof2(ctx, proof1, dbTx)
-	if err == nil {
-		proof2.Aggregating = false
-		err = a.State.UpdateGeneratedProof2(ctx, proof2, dbTx)
-	}
-
 	if err != nil {
 		log.Warnf("Failed to release proof aggregation state, err: %v", err)
 		dbTx.Rollback(ctx)
 		return err
 	}
 
-	dbTx.Commit(ctx)
+	proof2.Aggregating = false
+	err = a.State.UpdateGeneratedProof2(ctx, proof2, dbTx)
+	if err != nil {
+		log.Warnf("Failed to release proof aggregation state, err: %v", err)
+		dbTx.Rollback(ctx)
+		return err
+	}
+
+	if err := dbTx.Commit(ctx); err != nil {
+		return err
+	}
 
 	return nil
 }
 
-func (a *Aggregator2) getAndLockProofsToAggregate(ctx context.Context, prover proverClientInterface, ticker *time.Ticker) (*state.Proof2, *state.Proof2, error) {
-	a.StateDBMutex.Lock()
-	defer a.StateDBMutex.Unlock()
-
-	proof1, proof2, err := a.State.GetProofsToAggregate(ctx, nil)
-	if err != nil {
-		return nil, nil, err
-	}
+func (a *Aggregator2) getAndLockProofsToAggregate(ctx context.Context) (*state.Proof2, *state.Proof2, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
 	// Set proofs in aggregating state in a single transaction
 	dbTx, err := a.State.BeginStateTransaction(ctx)
@@ -369,119 +293,130 @@ func (a *Aggregator2) getAndLockProofsToAggregate(ctx context.Context, prover pr
 		return nil, nil, err
 	}
 
-	proof1.Aggregating = true
-	err = a.State.UpdateGeneratedProof2(ctx, proof1, dbTx)
-	if err == nil {
-		proof2.Aggregating = true
-		err = a.State.UpdateGeneratedProof2(ctx, proof2, dbTx)
+	proof1, proof2, err := a.State.GetProofsToAggregate(ctx, nil)
+	if err != nil {
+		return nil, nil, err
 	}
 
+	proof1.Aggregating = true
+	err = a.State.UpdateGeneratedProof2(ctx, proof1, dbTx)
 	if err != nil {
 		log.Errorf("Failed to set proof aggregation state, err: %v", err)
 		dbTx.Rollback(ctx)
 		return nil, nil, err
 	}
 
-	dbTx.Commit(ctx)
+	proof2.Aggregating = true
+	err = a.State.UpdateGeneratedProof2(ctx, proof2, dbTx)
+	if err != nil {
+		log.Errorf("Failed to set proof aggregation state, err: %v", err)
+		dbTx.Rollback(ctx)
+		return nil, nil, err
+	}
+
+	if err := dbTx.Commit(ctx); err != nil {
+		return nil, nil, err
+	}
 
 	return proof1, proof2, nil
 }
 
-func (a *Aggregator2) tryAggregateProofs(ctx context.Context, prover proverClientInterface, ticker *time.Ticker) (bool, error) {
-	log.Debugf("tryAggregateProols start %s", prover.GetURI())
+func (a *Aggregator2) aggregateProofs(ctx context.Context, prover proverInterface) (ok bool, err error) {
+	log.Debugf("aggregateProofs start %s", prover.ID())
 
-	proof1, proof2, err0 := a.getAndLockProofsToAggregate(ctx, prover, ticker)
-	if err0 != nil {
-		//··waitTick(ctx, ticker)
-		return false, err0
+	var proof1, proof2 *state.Proof2
+
+	proof1, proof2, err = a.getAndLockProofsToAggregate(ctx)
+	if errors.Is(err, state.ErrNotFound) {
+		// nothing to aggregate, swallow the error
+		log.Debug("Nothing to aggregate")
+		return false, nil
 	}
-
-	var err error
+	if err != nil {
+		return false, err
+	}
 
 	defer func() {
 		if err != nil {
-			err2 := a.unlockProofsToAggregate(ctx, proof1, proof2, ticker)
+			err2 := a.unlockProofsToAggregate(ctx, proof1, proof2)
 			if err2 != nil {
 				log.Errorf("Failed to release aggregated proofs, err: %v", err2)
 			}
 		}
 	}()
 
-	/*log.Infof("sending zki + batch to the prover, batchNumber: %d", batchToVerify.BatchNumber)
-	inputProver, err := a.buildInputProver(ctx, batchToVerify)
+	log.Infof("Prover %s is going to be used to aggregate proofs: %d-%d and %d-%d",
+		prover.ID(), proof1.BatchNumber, proof1.BatchNumberFinal, proof2.BatchNumber, proof2.BatchNumberFinal)
+
+	proverID := prover.ID()
+
+	aggrProof := &state.Proof2{
+		BatchNumber:      proof1.BatchNumber,
+		BatchNumberFinal: proof2.BatchNumberFinal,
+		Prover:           &proverID,
+		InputProver:      proof1.InputProver,
+		Aggregating:      false,
+	}
+
+	var aggrProofID string
+	aggrProofID, err = prover.AggregatedProof(proof1.Proof, proof2.Proof)
 	if err != nil {
-		log.Warnf("failed to build input prover, err: %v", err)
+		log.Errorf("Failed to instruct prover to generate aggregated proof: %w", err)
 		return false, err
-	}*/
+	}
 
-	log.Infof("Prover %s is going to be used to aggregate proofs: %d-%d and %d-%d", prover.GetURI(), proof1.BatchNumber, proof1.BatchNumberFinal, proof2.BatchNumber, proof2.BatchNumberFinal)
+	aggrProof.ProofID = &aggrProofID
 
-	/*log.Infof("sending a batch to the prover, OLDSTATEROOT: %s, NEWSTATEROOT: %s, BATCHNUM: %d",
-	inputProver.PublicInputs.OldStateRoot, inputProver.PublicInputs.NewStateRoot, inputProver.PublicInputs.BatchNum)
-	*/
-	proverURI := prover.GetURI()
-	//· Definir inputProver
-	proof := &state.Proof2{BatchNumber: proof1.BatchNumber, BatchNumberFinal: proof2.BatchNumberFinal, Prover: &proverURI, InputProver: proof1.InputProver, Aggregating: false}
+	log.Infof("Proof ID for aggregated proof %d-%d: %v", aggrProof.BatchNumber, aggrProof.BatchNumberFinal, *aggrProof.ProofID)
 
-	var genProofID string     //· Eliminar
-	genProofID = "1234567890" //· Eliminar
-	/*genProofID, err := prover.GetGenProofID(ctx, inputProver)
+	var proof string
+	proof, err = prover.WaitRecursiveProof(ctx, aggrProofID)
 	if err != nil {
-		log.Warnf("failed to get gen proof id, err: %v", err)
-		err2 := a.State.DeleteGeneratedProof(ctx, proof.BatchNumber, nil)
-		if err2 != nil {
-			log.Errorf("failed to delete proof generation mark after error, err: %v", err2)
-		}
-		//··waitTick(ctx, ticker)
+		log.Errorf("Failed to retrieve aggregated proof from prover: %w", err)
 		return false, err
-	}*/
+	}
 
-	proof.ProofID = &genProofID
-
-	log.Infof("Proof ID for aggregated proof %d-%d: %v", proof.BatchNumber, proof.BatchNumberFinal, *proof.ProofID)
-
-	/*err = a.getAndStoreProof(ctx, proof, prover)*/
-	proof.Proof = proof1.Proof //· Quitar
+	aggrProof.Proof = proof
 	time.Sleep(time.Duration(rand.Intn(20)+10) * time.Second)
 
-	proofSent, _ := a.trySendFinalProof(ctx, proof, ticker)
-
-	dbTx, err := a.State.BeginStateTransaction(ctx)
+	var dbTx pgx.Tx
+	dbTx, err = a.State.BeginStateTransaction(ctx)
 	if err != nil {
-		log.Errorf("Failed to begin transaction to store proof aggregation result, err: %v", err)
+		log.Errorf("Failed to begin transaction to store proof aggregation result, err: %w", err)
 		return false, err
 	}
 
-	// If the new aggregated proof has not been sent to L1 we store it
-	if !proofSent {
-		err = a.State.AddGeneratedProof2(ctx, proof, dbTx)
-	}
-
-	// Delete aggregated proofs
-	if err == nil {
-		err = a.State.DeleteGeneratedProof2(ctx, proof1.BatchNumber, proof1.BatchNumberFinal, nil)
-	}
-	if err == nil {
-		err = a.State.DeleteGeneratedProof2(ctx, proof2.BatchNumber, proof2.BatchNumberFinal, nil)
-	}
-
+	err = a.State.AddGeneratedProof2(ctx, aggrProof, dbTx)
 	if err != nil {
 		dbTx.Rollback(ctx)
 		log.Errorf("Failed to store proof aggregation result, err: %v", err)
-		//··waitTick(ctx, ticker)
+		return false, err
+	}
+
+	// Delete aggregated proofs
+	err = a.State.DeleteGeneratedProof2(ctx, proof1.BatchNumber, proof1.BatchNumberFinal, nil)
+	if err != nil {
+		dbTx.Rollback(ctx)
+		log.Errorf("Failed to delete aggregation input proof 1: %w", err)
+		return false, err
+	}
+	err = a.State.DeleteGeneratedProof2(ctx, proof2.BatchNumber, proof2.BatchNumberFinal, nil)
+	if err != nil {
+		dbTx.Rollback(ctx)
+		log.Errorf("Failed to delete aggregation input proof 2: %w", err)
 		return false, err
 	}
 
 	dbTx.Commit(ctx)
 
-	log.Debug("tryAggregateProols end")
+	log.Debug("aggregateProofs end")
 
 	return true, nil
 }
 
-func (a *Aggregator2) getAndLockBatchToProve(ctx context.Context, prover proverClientInterface, ticker *time.Ticker) (*state.Batch, *state.Proof2, error) {
-	a.StateDBMutex.Lock()
-	defer a.StateDBMutex.Unlock()
+func (a *Aggregator2) getAndLockBatchToProve(ctx context.Context, prover proverInterface) (*state.Batch, *state.Proof2, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
 	lastVerifiedBatch, err := a.State.GetLastVerifiedBatch(ctx, nil)
 	if err != nil {
@@ -501,38 +436,46 @@ func (a *Aggregator2) getAndLockBatchToProve(ctx context.Context, prover proverC
 	isProfitable, err := a.ProfitabilityChecker.IsProfitable(ctx, big.NewInt(0))
 	if err != nil {
 		log.Errorf("Failed to check aggregator profitability, err: %v", err)
-		//··waitTick(ctx, ticker)
 		return nil, nil, err
 	}
 
 	if !isProfitable {
 		log.Infof("Batch %d is not profitable, matic collateral %d", batchToVerify.BatchNumber, big.NewInt(0))
-		//··waitTick(ctx, ticker)
 		return nil, nil, err
 	}
 
-	proverURI := prover.GetURI()
-	proof := &state.Proof2{BatchNumber: batchToVerify.BatchNumber, BatchNumberFinal: batchToVerify.BatchNumber, Prover: &proverURI, Aggregating: false}
+	proverID := prover.ID()
+	proof := &state.Proof2{
+		BatchNumber:      batchToVerify.BatchNumber,
+		BatchNumberFinal: batchToVerify.BatchNumber,
+		Prover:           &proverID,
+		Aggregating:      false,
+	}
 
 	// Avoid other thread to process the same batch
 	err = a.State.AddGeneratedProof2(ctx, proof, nil)
 	if err != nil {
 		log.Errorf("Failed to add batch proof, err: %v", err)
-		//··waitTick(ctx, ticker)
 		return nil, nil, err
 	}
 
 	return batchToVerify, proof, nil
 }
 
-func (a *Aggregator2) tryGenerateProofs(ctx context.Context, prover proverClientInterface, ticker *time.Ticker) (bool, error) {
-	batchToProve, proof, err0 := a.getAndLockBatchToProve(ctx, prover, ticker)
-	if err0 != nil {
-		//··waitTick(ctx, ticker)
-		return false, err0
+func (a *Aggregator2) generateProof(ctx context.Context, prover proverInterface) (ok bool, err error) {
+	var (
+		batchToProve *state.Batch
+		proof        *state.Proof2
+	)
+	batchToProve, proof, err = a.getAndLockBatchToProve(ctx, prover)
+	if errors.Is(err, state.ErrNotFound) {
+		// nothing to prove, swallow the error
+		log.Debug("No batches to prove")
+		return false, nil
 	}
-
-	var err error
+	if err != nil {
+		return false, err
+	}
 
 	defer func() {
 		if err != nil {
@@ -543,23 +486,21 @@ func (a *Aggregator2) tryGenerateProofs(ctx context.Context, prover proverClient
 		}
 	}()
 
-	log.Infof("Prover %s is going to be used for batchNumber: %d", prover.GetURI(), batchToProve.BatchNumber)
+	log.Infof("Prover %s is going to be used for batchNumber: %d", prover.ID(), batchToProve.BatchNumber)
 
 	log.Infof("Sending zki + batch to the prover, batchNumber: %d", batchToProve.BatchNumber)
 	proof.InputProver, err = a.buildInputProver(ctx, batchToProve)
 	if err != nil {
 		log.Errorf("Failed to build input prover, err: %v", err)
-		//··waitTick(ctx, ticker)
 		return false, err
 	}
 
-	log.Infof("Sending a batch to the prover, OLDSTATEROOT: %s, NEWSTATEROOT: %s, BATCHNUM: %d",
-		proof.InputProver.PublicInputs.OldStateRoot, proof.InputProver.PublicInputs.NewStateRoot, proof.InputProver.PublicInputs.BatchNum)
+	log.Infof("Sending a batch to the prover, OLDSTATEROOT: %s, BATCHNUM: %d",
+		proof.InputProver.PublicInputs.OldStateRoot, batchToProve.BatchNumber)
 
-	genProofID, err := prover.GetGenProofID(ctx, proof.InputProver)
+	genProofID, err := prover.BatchProof(proof.InputProver)
 	if err != nil {
-		log.Errorf("Failed to get gen proof id, err: %v", err)
-		//··waitTick(ctx, ticker)
+		log.Errorf("Failed instruct prover to prove a batch: %w", err)
 		return false, err
 	}
 
@@ -567,37 +508,32 @@ func (a *Aggregator2) tryGenerateProofs(ctx context.Context, prover proverClient
 
 	log.Infof("Proof ID for batchNumber %d: %v", proof.BatchNumber, *proof.ProofID)
 
-	resGetProof, err := prover.GetResGetProof(ctx, *proof.ProofID, proof.BatchNumber)
+	resGetProof, err := prover.WaitRecursiveProof(ctx, *proof.ProofID)
 	if err != nil {
 		log.Errorf("Failed to get proof from prover, err: %v", err)
-		//··waitTick(ctx, ticker)
 		return false, err
 	}
-
 	proof.Proof = resGetProof
 
-	a.compareInputHashes(proof.InputProver, proof.Proof)
+	// TODO(pg): remove?
+	// a.compareInputHashes(proof.InputProver, proof.Proof)
 
+	// TODO(pg): remove?
 	// Handle local exit root in the case of the mock prover
-	if proof.Proof.Public.PublicInputs.NewLocalExitRoot == "0x17c04c3760510b48c6012742c540a81aba4bca2f78b9d14bfd2f123e2e53ea3e" {
-		// This local exit root comes from the mock, use the one captured by the executor instead
-		log.Warnf(
-			"NewLocalExitRoot looks like a mock value, using value from executor instead: %v",
-			proof.InputProver.PublicInputs.NewLocalExitRoot,
-		)
-		resGetProof.Public.PublicInputs.NewLocalExitRoot = proof.InputProver.PublicInputs.NewLocalExitRoot
-	}
+	// if proof.Proof.Public.PublicInputs.NewLocalExitRoot == "0x17c04c3760510b48c6012742c540a81aba4bca2f78b9d14bfd2f123e2e53ea3e" {
+	// 	// This local exit root comes from the mock, use the one captured by the executor instead
+	// 	log.Warnf(
+	// 		"NewLocalExitRoot looks like a mock value, using value from executor instead: %v",
+	// 		proof.InputProver.PublicInputs.NewLocalExitRoot,
+	// 	)
+	// 	resGetProof.Public.PublicInputs.NewLocalExitRoot = proof.InputProver.PublicInputs.NewLocalExitRoot
+	// }
 
-	proofSent, _ := a.trySendFinalProof(ctx, proof, ticker)
-
-	if !proofSent {
-		// Store proof
-		err = a.State.UpdateGeneratedProof2(ctx, proof, nil)
-		if err != nil {
-			log.Errorf("Failed to store batch proof result, err: %v", err)
-			//··waitTick(ctx, ticker)
-			return false, err
-		}
+	// Store proof
+	err = a.State.UpdateGeneratedProof2(ctx, proof, nil)
+	if err != nil {
+		log.Errorf("Failed to store batch proof result, err: %v", err)
+		return false, err
 	}
 
 	return true, nil
@@ -625,35 +561,36 @@ func (a *Aggregator2) isSynced(ctx context.Context) bool {
 	return true
 }
 
-func (a *Aggregator2) buildInputProver(ctx context.Context, batchToVerify *state.Batch) (*pb.InputProver, error) {
+func (a *Aggregator2) buildInputProver(ctx context.Context, batchToVerify *state.Batch) (*pb2.InputProver, error) {
 	previousBatch, err := a.State.GetBatchByNumber(ctx, batchToVerify.BatchNumber-1, nil)
-	if err != nil && err != state.ErrStateNotSynchronized {
-		return nil, fmt.Errorf("Failed to get previous batch, err: %v", err)
+	if err != nil && !errors.Is(err, state.ErrStateNotSynchronized) {
+		return nil, fmt.Errorf("Failed to get previous batch, err: %w", err)
 	}
 
 	blockTimestampByte := make([]byte, 8) //nolint:gomnd
 	binary.BigEndian.PutUint64(blockTimestampByte, uint64(batchToVerify.Timestamp.Unix()))
-	batchHashData := common.BytesToHash(keccak256.Hash(
-		batchToVerify.BatchL2Data,
-		batchToVerify.GlobalExitRoot[:],
-		blockTimestampByte,
-		batchToVerify.Coinbase[:],
-	))
-	inputProver := &pb.InputProver{
-		PublicInputs: &pb.PublicInputs{
-			OldStateRoot:     previousBatch.StateRoot.String(),
-			OldLocalExitRoot: previousBatch.LocalExitRoot.String(),
-			NewStateRoot:     batchToVerify.StateRoot.String(),
-			NewLocalExitRoot: batchToVerify.LocalExitRoot.String(),
-			SequencerAddr:    batchToVerify.Coinbase.String(),
-			BatchHashData:    batchHashData.String(),
-			BatchNum:         uint32(batchToVerify.BatchNumber),
-			EthTimestamp:     uint64(batchToVerify.Timestamp.Unix()),
-			AggregatorAddr:   a.Ethman.GetPublicAddress().String(),
-			ChainId:          a.cfg.ChainID,
+	// batchHashData := common.BytesToHash(keccak256.Hash(
+	// 	batchToVerify.BatchL2Data,
+	// 	batchToVerify.GlobalExitRoot[:],
+	// 	blockTimestampByte,
+	// 	batchToVerify.Coinbase[:],
+	// ))
+	inputProver := &pb2.InputProver{
+		PublicInputs: &pb2.PublicInputs{
+			OldStateRoot:    previousBatch.StateRoot.Bytes(),
+			OldAccInputHash: nil, // FIXME(pg)
+			// OldLocalExitRoot: previousBatch.LocalExitRoot.String(),
+			// NewStateRoot:     batchToVerify.StateRoot.String(),
+			// NewLocalExitRoot: batchToVerify.LocalExitRoot.String(),
+			// BatchHashData:    batchHashData.String(),
+			OldBatchNum:    batchToVerify.BatchNumber,
+			ChainId:        a.cfg.ChainID,
+			BatchL2Data:    batchToVerify.BatchL2Data,
+			GlobalExitRoot: batchToVerify.GlobalExitRoot.Bytes(),
+			EthTimestamp:   uint64(batchToVerify.Timestamp.Unix()),
+			SequencerAddr:  batchToVerify.Coinbase.String(),
+			AggregatorAddr: a.Ethman.GetPublicAddress().String(),
 		},
-		GlobalExitRoot:    batchToVerify.GlobalExitRoot.String(),
-		BatchL2Data:       hex.EncodeToString(batchToVerify.BatchL2Data),
 		Db:                map[string]string{},
 		ContractsBytecode: map[string]string{},
 	}
@@ -698,15 +635,6 @@ func (a *Aggregator2) compareInputHashes(ip *pb.InputProver, resGetProof *pb.Get
 		log.Debug("inputProver.PublicInputs.BatchHashData: ", ip.PublicInputs.BatchHashData)
 		log.Debug("inputProver.PublicInputs.BatchNum: ", ip.PublicInputs.BatchNum)
 		log.Debug("inputProver.PublicInputs.EthTimestamp: ", ip.PublicInputs.EthTimestamp)
-	}
-}
-
-func waitTick(ctx context.Context, ticker *time.Ticker) {
-	select {
-	case <-ticker.C:
-		// nothing
-	case <-ctx.Done():
-		return
 	}
 }
 

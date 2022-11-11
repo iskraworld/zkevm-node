@@ -6,6 +6,9 @@ import (
 	"path"
 	"runtime"
 	"strings"
+	"sync"
+	"testing"
+	"time"
 
 	"github.com/0xPolygonHermez/zkevm-node/log"
 	"github.com/spf13/afero"
@@ -78,4 +81,18 @@ func GetEnv(key string, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// WaitUntil calls wg.Wait until timeout is elapsed, which fails the test.
+func WaitUntil(t *testing.T, wg *sync.WaitGroup, timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		t.Fatalf("WaitGroup not done, test time expired after %s", timeout)
+	}
 }

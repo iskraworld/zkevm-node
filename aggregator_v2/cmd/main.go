@@ -16,7 +16,7 @@ import (
 )
 
 func main() {
-	cfg := aggregator2.ServerConfig{
+	cfg := aggregator2.Config{
 		Host:                       "0.0.0.0",
 		Port:                       8888,
 		IntervalToConsolidateState: types.NewDuration(time.Second),
@@ -26,8 +26,8 @@ func main() {
 	}
 	ctx := context.Background()
 
-	srv := aggregator2.NewServer(&cfg)
-	srv.Start()
+	a := aggregator2.New(&cfg)
+	a.Start()
 
 	// connect
 	opts := []grpc.DialOption{

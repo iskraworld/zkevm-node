@@ -90,7 +90,7 @@ func start(cliCtx *cli.Context) error {
 		case AGGREGATOR2:
 			log.Info("Running aggregator2")
 			c.Aggregator2.ProverURIs = c.Provers.ProverURIs
-			go runAggregator2(ctx, c.Aggregator2, etherman, ethTxManager, st, grpcClientConns)
+			go runAggregator2(ctx, c.Aggregator2, etherman, ethTxManager, st)
 		case SEQUENCER:
 			log.Info("Running sequencer")
 			poolInstance := createPool(c.PoolDB, c.NetworkConfig.L2BridgeAddr, l2ChainID, st)
@@ -205,8 +205,8 @@ func runAggregator(ctx context.Context, c aggregator.Config, ethman *etherman.Cl
 	agg.Start(ctx)
 }
 
-func runAggregator2(ctx context.Context, c aggregator2.Config, ethman *etherman.Client, ethTxManager *ethtxmanager.Client, state *state.State, grpcClientConns []*grpc.ClientConn) {
-	agg, err := aggregator2.NewAggregator2(c, state, ethTxManager, ethman, grpcClientConns)
+func runAggregator2(ctx context.Context, c aggregator2.Config, ethman *etherman.Client, ethTxManager *ethtxmanager.Client, state *state.State) {
+	agg, err := aggregator2.New(c, state, ethTxManager, ethman)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -16,7 +16,8 @@ import (
 type proverInterface interface {
 	ID() string
 	IsIdle() bool
-	ProveBatch(input *pb.InputProver) (string, error)
+	BatchProof(input *pb2.InputProver) (string, error)
+	AggregatedProof(inputProof1, inputProof2 string) (string, error)
 	FinalProof(inputProof string) (string, error)
 	WaitRecursiveProof(ctx context.Context, proofID string) (string, error)
 	WaitFinalProof(ctx context.Context, proofID string) (*pb2.FinalProof, error)
@@ -25,7 +26,7 @@ type proverInterface interface {
 // ethTxManager contains the methods required to send txs to
 // ethereum.
 type ethTxManager interface {
-	VerifyBatch(ctx context.Context, batchNum uint64, proof *pb.GetProofResponse) error
+	SendProof(ctx context.Context, proof *pb2.FinalProof) error
 }
 
 // etherman contains the methods required to interact with ethereum
@@ -60,4 +61,5 @@ type stateInterface interface {
 	DeleteGeneratedProof2(ctx context.Context, batchNumber uint64, batchNumberFinal uint64, dbTx pgx.Tx) error
 	DeleteUngeneratedProofs2(ctx context.Context, dbTx pgx.Tx) error
 	GetWIPProofByProver2(ctx context.Context, prover string, dbTx pgx.Tx) (*state.Proof2, error)
+	GetGeneratedProofByBatchNumber(ctx context.Context, batchNumber uint64, dbTx pgx.Tx) (*state.Proof, error)
 }

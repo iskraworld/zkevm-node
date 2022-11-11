@@ -61,9 +61,9 @@ func (p *Prover) IsIdle() bool {
 	return status.Status == pb.GetStatusResponse_IDLE
 }
 
-// ProveBatch instructs the prover to generate a batch proof for the provided
+// BatchProof instructs the prover to generate a batch proof for the provided
 // input. It returns the ID of the proof being computed.
-func (p *Prover) ProveBatch(input *pb.InputProver) (string, error) {
+func (p *Prover) BatchProof(input *pb.InputProver) (string, error) {
 	req := &pb.AggregatorMessage{
 		Request: &pb.AggregatorMessage_GenBatchProofRequest{
 			GenBatchProofRequest: &pb.GenBatchProofRequest{Input: input},
