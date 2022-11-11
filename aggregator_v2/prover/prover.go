@@ -61,9 +61,9 @@ func (p *Prover) IsIdle() bool {
 	return status.Status == pb.GetStatusResponse_IDLE
 }
 
-// BatchProof instructs the prover to generate a batch proof for the provided
+// ProveBatch instructs the prover to generate a batch proof for the provided
 // input. It returns the ID of the proof being computed.
-func (p *Prover) BatchProof(input *pb.InputProver) (*pb.GenBatchProofResponse, error) {
+func (p *Prover) ProveBatch(input *pb.InputProver) (string, error) {
 	req := &pb.AggregatorMessage{
 		Request: &pb.AggregatorMessage_GenBatchProofRequest{
 			GenBatchProofRequest: &pb.GenBatchProofRequest{Input: input},
@@ -71,19 +71,19 @@ func (p *Prover) BatchProof(input *pb.InputProver) (*pb.GenBatchProofResponse, e
 	}
 	res, err := p.call(req)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	if msg, ok := res.Response.(*pb.ProverMessage_GenBatchProofResponse); ok {
 		// TODO(pg): handle all cases
 		switch msg.GenBatchProofResponse.Result {
 		case pb.Result_UNSPECIFIED:
 		case pb.Result_OK:
-			return msg.GenBatchProofResponse, nil
+			return msg.GenBatchProofResponse.Id, nil
 		case pb.Result_ERROR:
 		case pb.Result_INTERNAL_ERROR:
 		}
 	}
-	return nil, errors.New("bad response") // FIXME(pg)
+	return "", errors.New("bad response") // FIXME(pg)
 }
 
 // AggregatedProof instructs the prover to generate an aggregated proof from

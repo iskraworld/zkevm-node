@@ -16,6 +16,7 @@ import (
 type proverInterface interface {
 	ID() string
 	IsIdle() bool
+	ProveBatch(input *pb.InputProver) (string, error)
 	WaitRecursiveProof(ctx context.Context, proofID string) (string, error)
 	WaitFinalProof(ctx context.Context, proofID string) (*pb2.FinalProof, error)
 }
