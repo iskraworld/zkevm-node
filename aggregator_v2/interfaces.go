@@ -4,6 +4,7 @@ import (
 	"context"
 	"math/big"
 
+	pb2 "github.com/0xPolygonHermez/zkevm-node/aggregator_v2/pb"
 	"github.com/0xPolygonHermez/zkevm-node/proverclient/pb"
 	"github.com/0xPolygonHermez/zkevm-node/state"
 	"github.com/ethereum/go-ethereum/common"
@@ -15,6 +16,8 @@ import (
 type proverInterface interface {
 	ID() string
 	IsIdle() bool
+	WaitRecursiveProof(ctx context.Context, proofID string) (string, error)
+	WaitFinalProof(ctx context.Context, proofID string) (*pb2.FinalProof, error)
 }
 
 // ethTxManager contains the methods required to send txs to
