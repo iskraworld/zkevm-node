@@ -265,10 +265,6 @@ init-network: ## Initializes the network
 deploy-sc: ## deploys some examples of transactions and smart contracts
 	go run ./scripts/deploy_sc/main.go .
 
-.PHONY: send-transfers
-send-transfers: ## deploys some ETH transfers
-	go run ./scripts/send_transfers/main.go .
-
 .PHONY: deploy-uniswap
 deploy-uniswap: ## deploy the uniswap environment to the network
 	go run ./scripts/uniswap/main.go .
