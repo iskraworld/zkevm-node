@@ -93,6 +93,8 @@ type Client struct {
 	GasProviders externalGasProviders
 
 	auth *bind.TransactOpts // nil in case of read-only client
+
+	cfg Config
 }
 
 // NewClient creates a new etherman.
@@ -141,6 +143,7 @@ func NewClient(cfg Config, auth *bind.TransactOpts) (*Client, error) {
 			Providers:        gProviders,
 		},
 		auth: auth,
+		cfg:  cfg,
 	}, nil
 }
 
@@ -391,7 +394,6 @@ func (etherMan *Client) forcedBatchEvent(ctx context.Context, vLog types.Log, bl
 	}
 	msg, err := tx.AsMessage(types.NewLondonSigner(tx.ChainId()), big.NewInt(0))
 	if err != nil {
-		log.Error(err)
 		return err
 	}
 	if fb.Sequencer == msg.From() {
@@ -440,7 +442,6 @@ func (etherMan *Client) sequencedBatchesEvent(ctx context.Context, vLog types.Lo
 	}
 	msg, err := tx.AsMessage(types.NewLondonSigner(tx.ChainId()), big.NewInt(0))
 	if err != nil {
-		log.Error(err)
 		return err
 	}
 	sequences, err := decodeSequences(tx.Data(), sb.NumBatch, msg.From(), vLog.TxHash)
@@ -570,7 +571,6 @@ func (etherMan *Client) forceSequencedBatchesEvent(ctx context.Context, vLog typ
 	}
 	msg, err := tx.AsMessage(types.NewLondonSigner(tx.ChainId()), big.NewInt(0))
 	if err != nil {
-		log.Error(err)
 		return err
 	}
 	sequencedForceBatch.Coinbase = msg.From()
