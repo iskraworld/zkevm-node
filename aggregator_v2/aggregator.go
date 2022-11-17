@@ -24,8 +24,18 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 )
 
+type proverJob struct {
+	jobType string           // TODO make enum
+	jobChan chan interface{} // TODO make job result type
+}
+
+type proverCli struct {
+	ctx     context.Context
+	jobChan chan proverJob
+}
+
 // Aggregator represents an aggregator.
-type Aggregator2 struct {
+type AggregatorV2 struct {
 	pb2.UnimplementedAggregatorServiceServer
 
 	cfg Config
@@ -38,7 +48,9 @@ type Aggregator2 struct {
 
 	timeSendFinalProof time.Time
 	mu                 *sync.Mutex
+	provers            chan proverCli
 	cutOff             <-chan time.Time
+	finalCh            chan proverJob // this needs to be passed on prover init
 	srv                *grpc.Server
 	ctx                context.Context
 	exit               context.CancelFunc
@@ -50,7 +62,7 @@ func New(
 	stateInterface stateInterface,
 	ethTxManager ethTxManager,
 	etherman etherman,
-) (*Aggregator2, error) {
+) (*AggregatorV2, error) {
 	var profitabilityChecker aggregatorTxProfitabilityChecker // FIXME
 	switch cfg.TxProfitabilityCheckerType {
 	case ProfitabilityBase:
@@ -59,13 +71,12 @@ func New(
 		profitabilityChecker = NewTxProfitabilityCheckerAcceptAll(stateInterface, cfg.IntervalAfterWhichBatchConsolidateAnyway.Duration)
 	}
 
-	a := &Aggregator2{
-		cfg: cfg,
-
+	a := &AggregatorV2{
 		State:                stateInterface,
 		EthTxManager:         ethTxManager,
 		Ethman:               etherman,
 		ProfitabilityChecker: profitabilityChecker,
+		cfg:                  cfg,
 		mu:                   &sync.Mutex{},
 	}
 
@@ -73,7 +84,7 @@ func New(
 }
 
 // Start starts the aggregator
-func (a *Aggregator2) Start(ctx context.Context) {
+func (a *AggregatorV2) Start(ctx context.Context) {
 	var cancel context.CancelFunc
 	if ctx == nil {
 		ctx = context.Background()
@@ -83,9 +94,9 @@ func (a *Aggregator2) Start(ctx context.Context) {
 	a.exit = cancel
 	a.timeSendFinalProof = time.Now().Add(a.cfg.IntervalToSendFinalProof.Duration)
 
-	ticker := time.NewTicker(a.cfg.IntervalToSendFinalProof.Duration)
-	defer ticker.Stop()
-	a.cutOff = ticker.C
+	a.cutOff = time.After(a.cfg.IntervalToSendFinalProof.Duration)
+	a.provers = make(chan proverCli)
+	a.finalCh = make(chan proverJob)
 
 	address := fmt.Sprintf("%s:%d", a.cfg.Host, a.cfg.Port)
 	lis, err := net.Listen("tcp", address)
@@ -109,17 +120,70 @@ func (a *Aggregator2) Start(ctx context.Context) {
 
 	// Wait until context is done
 	<-ctx.Done()
+	a.Stop()
 }
 
 // Stop stops the Aggregator server.
-func (a *Aggregator2) Stop() {
+func (a *AggregatorV2) Stop() {
 	a.srv.Stop()
 	a.exit()
 }
 
+func (a *AggregatorV2) orchestrate() {
+	proofChan := make(chan interface{})
+	finalChan := make(chan interface{})
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case final := <-finalChan:
+			_ = final
+			// TODO send final
+			a.cutOff = time.After(a.cfg.IntervalToSendFinalProof.Duration)
+		case proof := <-proofChan:
+			select {
+			case <-a.cutOff:
+				select {
+				case <-a.ctx.Done():
+					return
+				default:
+					a.finalCh <- proverJob{
+						jobType: "final",
+						jobChan: finalChan,
+					}
+				}
+			default:
+				_ = proof
+				// TODO store proof
+			}
+		case prover := <-a.provers:
+			select {
+			case <-a.ctx.Done():
+				return
+			case <-prover.ctx.Done():
+				continue
+			default:
+				// check aggregate
+				if true {
+					prover.jobChan <- proverJob{
+						jobType: "aggregate",
+						jobChan: proofChan,
+					}
+				} else {
+					// check batches
+					prover.jobChan <- proverJob{
+						jobType: "generate",
+						jobChan: proofChan,
+					}
+				}
+			}
+		}
+	}
+}
+
 // Channel implements the bi-directional communication channel between the
 // Prover client and the Aggregator server.
-func (a *Aggregator2) Channel(stream pb2.AggregatorService_ChannelServer) error {
+func (a *AggregatorV2) Channel(stream pb2.AggregatorService_ChannelServer) error {
 	prover, err := prover2.New(&a.cfg.Prover, stream)
 	if err != nil {
 		return err
@@ -141,9 +205,10 @@ func (a *Aggregator2) Channel(stream pb2.AggregatorService_ChannelServer) error 
 				err := a.sendFinalProof(ctx, prover)
 				if err != nil {
 					log.Errorf("failed to send final proof: ", err)
+					a.exit()
+					return
 				}
-				a.exit()
-				return
+				a.cutOff = time.After(a.cfg.IntervalToSendFinalProof.Duration)
 			default:
 				if !prover.IsIdle() {
 					log.Warn("Prover ID %s is not idle", prover.ID())
@@ -190,11 +255,11 @@ func (a *Aggregator2) Channel(stream pb2.AggregatorService_ChannelServer) error 
 	}
 }
 
-func (a *Aggregator2) getAndLockProofToFinalize(ctx context.Context) (*state.Proof2, error) {
+func (a *AggregatorV2) getAndLockProofToFinalize(ctx context.Context) (*state.Proof2, error) {
 	return nil, nil
 }
 
-func (a *Aggregator2) sendFinalProof(ctx context.Context, prover proverInterface) error {
+func (a *AggregatorV2) sendFinalProof(ctx context.Context, prover proverInterface) error {
 	log.Debug("Checking if network is synced")
 	for !a.isSynced(ctx) {
 		log.Debug("Waiting for synchronizer to sync...")
@@ -251,7 +316,7 @@ func (a *Aggregator2) sendFinalProof(ctx context.Context, prover proverInterface
 	return nil
 }
 
-func (a *Aggregator2) unlockProofsToAggregate(ctx context.Context, proof1 *state.Proof2, proof2 *state.Proof2) error {
+func (a *AggregatorV2) unlockProofsToAggregate(ctx context.Context, proof1 *state.Proof2, proof2 *state.Proof2) error {
 	// Release proofs from aggregating state in a single transaction
 	dbTx, err := a.State.BeginStateTransaction(ctx)
 	if err != nil {
@@ -282,7 +347,7 @@ func (a *Aggregator2) unlockProofsToAggregate(ctx context.Context, proof1 *state
 	return nil
 }
 
-func (a *Aggregator2) getAndLockProofsToAggregate(ctx context.Context) (*state.Proof2, *state.Proof2, error) {
+func (a *AggregatorV2) getAndLockProofsToAggregate(ctx context.Context) (*state.Proof2, *state.Proof2, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -321,7 +386,7 @@ func (a *Aggregator2) getAndLockProofsToAggregate(ctx context.Context) (*state.P
 	return proof1, proof2, nil
 }
 
-func (a *Aggregator2) aggregateProofs(ctx context.Context, prover proverInterface) (ok bool, err error) {
+func (a *AggregatorV2) aggregateProofs(ctx context.Context, prover proverInterface) (ok bool, err error) {
 	log.Debugf("aggregateProofs start %s", prover.ID())
 
 	var proof1, proof2 *state.Proof2
@@ -414,7 +479,7 @@ func (a *Aggregator2) aggregateProofs(ctx context.Context, prover proverInterfac
 	return true, nil
 }
 
-func (a *Aggregator2) getAndLockBatchToProve(ctx context.Context, prover proverInterface) (*state.Batch, *state.Proof2, error) {
+func (a *AggregatorV2) getAndLockBatchToProve(ctx context.Context, prover proverInterface) (*state.Batch, *state.Proof2, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -462,7 +527,7 @@ func (a *Aggregator2) getAndLockBatchToProve(ctx context.Context, prover proverI
 	return batchToVerify, proof, nil
 }
 
-func (a *Aggregator2) generateProof(ctx context.Context, prover proverInterface) (ok bool, err error) {
+func (a *AggregatorV2) generateProof(ctx context.Context, prover proverInterface) (ok bool, err error) {
 	var (
 		batchToProve *state.Batch
 		proof        *state.Proof2
@@ -539,7 +604,7 @@ func (a *Aggregator2) generateProof(ctx context.Context, prover proverInterface)
 	return true, nil
 }
 
-func (a *Aggregator2) isSynced(ctx context.Context) bool {
+func (a *AggregatorV2) isSynced(ctx context.Context) bool {
 	lastVerifiedBatch, err := a.State.GetLastVerifiedBatch(ctx, nil)
 	if err != nil && err != state.ErrNotFound {
 		log.Warnf("Failed to get last consolidated batch, err: %v", err)
@@ -561,7 +626,7 @@ func (a *Aggregator2) isSynced(ctx context.Context) bool {
 	return true
 }
 
-func (a *Aggregator2) buildInputProver(ctx context.Context, batchToVerify *state.Batch) (*pb2.InputProver, error) {
+func (a *AggregatorV2) buildInputProver(ctx context.Context, batchToVerify *state.Batch) (*pb2.InputProver, error) {
 	previousBatch, err := a.State.GetBatchByNumber(ctx, batchToVerify.BatchNumber-1, nil)
 	if err != nil && !errors.Is(err, state.ErrStateNotSynchronized) {
 		return nil, fmt.Errorf("Failed to get previous batch, err: %w", err)
@@ -598,7 +663,7 @@ func (a *Aggregator2) buildInputProver(ctx context.Context, batchToVerify *state
 	return inputProver, nil
 }
 
-func (a *Aggregator2) compareInputHashes(ip *pb.InputProver, resGetProof *pb.GetProofResponse) {
+func (a *AggregatorV2) compareInputHashes(ip *pb.InputProver, resGetProof *pb.GetProofResponse) {
 	// Calc inputHash
 	batchNumberByte := make([]byte, 4) //nolint:gomnd
 	binary.BigEndian.PutUint32(batchNumberByte, ip.PublicInputs.BatchNum)
