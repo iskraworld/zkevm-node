@@ -3,6 +3,7 @@ package aggregator2
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -11,13 +12,11 @@ import (
 	"sync"
 	"time"
 
-	pb2 "github.com/0xPolygonHermez/zkevm-node/aggregator_v2/pb"
-	prover2 "github.com/0xPolygonHermez/zkevm-node/aggregator_v2/prover"
-	"github.com/0xPolygonHermez/zkevm-node/encoding"
-	"github.com/0xPolygonHermez/zkevm-node/hex"
+	"github.com/0xPolygonHermez/zkevm-node/aggregator_v2/pb"
+	"github.com/0xPolygonHermez/zkevm-node/aggregator_v2/prover"
 	"github.com/0xPolygonHermez/zkevm-node/log"
-	"github.com/0xPolygonHermez/zkevm-node/proverclient/pb"
 	"github.com/0xPolygonHermez/zkevm-node/state"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/iden3/go-iden3-crypto/keccak256"
 	"github.com/jackc/pgx/v4"
 	"google.golang.org/grpc"
@@ -34,16 +33,15 @@ type proverCli struct {
 	jobChan chan proverJob
 }
 
-// Aggregator represents an aggregator.
+// AggregatorV2 represents an aggregator
 type AggregatorV2 struct {
-	pb2.UnimplementedAggregatorServiceServer
+	pb.UnimplementedAggregatorServiceServer
 
 	cfg Config
 
 	State                stateInterface
 	EthTxManager         ethTxManager
 	Ethman               etherman
-	ProverClients        []proverClientInterface
 	ProfitabilityChecker aggregatorTxProfitabilityChecker
 
 	timeSendFinalProof time.Time
@@ -105,7 +103,7 @@ func (a *AggregatorV2) Start(ctx context.Context) {
 	}
 
 	a.srv = grpc.NewServer()
-	pb2.RegisterAggregatorServiceServer(a.srv, a)
+	pb.RegisterAggregatorServiceServer(a.srv, a)
 
 	healthService := newHealthChecker()
 	grpc_health_v1.RegisterHealthServer(a.srv, healthService)
@@ -183,8 +181,8 @@ func (a *AggregatorV2) orchestrate() {
 
 // Channel implements the bi-directional communication channel between the
 // Prover client and the Aggregator server.
-func (a *AggregatorV2) Channel(stream pb2.AggregatorService_ChannelServer) error {
-	prover, err := prover2.New(&a.cfg.Prover, stream)
+func (a *AggregatorV2) Channel(stream pb.AggregatorService_ChannelServer) error {
+	prover, err := prover.New(&a.cfg.Prover, stream)
 	if err != nil {
 		return err
 	}
@@ -253,9 +251,11 @@ func (a *AggregatorV2) Channel(stream pb2.AggregatorService_ChannelServer) error
 			return nil
 		}
 	}
+
 }
 
-func (a *AggregatorV2) getAndLockProofToFinalize(ctx context.Context) (*state.Proof2, error) {
+func (a *AggregatorV2) getAndLockProofToFinalize(ctx context.Context) (*state.RecursiveProof, error) {
+	// TODO
 	return nil, nil
 }
 
@@ -293,30 +293,75 @@ func (a *AggregatorV2) sendFinalProof(ctx context.Context, prover proverInterfac
 		return nil
 	}
 
-	log.Infof("Generating final proof for batches %d-%d", proof.BatchNumber, proof.BatchNumberFinal)
-	var finalProofID string
-	finalProofID, err = prover.FinalProof(proof.Proof)
+	bComplete, err := a.State.CheckProofContainsCompleteSequences(ctx, proof, nil)
+
+	if !bComplete {
+		log.Infof("Recursive proof %d-%d does not contain completes sequences", proof.BatchNumber, proof.BatchNumberFinal)
+		return nil
+	}
+
+	log.Infof("Prover %s is going to be used to generate final proof for batches: %d-%d", prover.ID(), proof.BatchNumber, proof.BatchNumberFinal)
+
+	finalProofID, err := prover.FinalProof(proof.Proof)
 	if err != nil {
 		return fmt.Errorf("Failed to instruct prover to prepare final proof: %w", err)
 	}
 
-	var finalProof *pb2.FinalProof
-	finalProof, err = prover.WaitFinalProof(ctx, finalProofID)
+	finalProof, err := prover.WaitFinalProof(ctx, finalProofID)
 	if err != nil {
 		return fmt.Errorf("Failed to get final proof: %w", err)
 	}
 
-	log.Infof("Verfiying final proof with ethereum smart contract, batches %d-%d", proof.BatchNumber, proof.BatchNumberFinal)
-	err = a.EthTxManager.SendProof(ctx, finalProof)
-	if err != nil {
-		return fmt.Errorf("Error verifiying final proof for batches %d-%d: %w", proof.BatchNumber, proof.BatchNumberFinal, err)
+	//b, err := json.Marshal(resGetProof.FinalProof)
+	log.Infof("Final proof %s generated", *proof.ProofID)
+
+	var inputProver *pb.InputProver
+	json.Unmarshal([]byte(proof.InputProver), inputProver)
+	a.compareInputHashes(inputProver, finalProof)
+
+	// Handle local exit root in the case of the mock prover
+	if string(finalProof.Public.NewLocalExitRoot[:]) == "0x17c04c3760510b48c6012742c540a81aba4bca2f78b9d14bfd2f123e2e53ea3e" {
+		// This local exit root comes from the mock, use the one captured by the executor instead
+		log.Warnf("NewLocalExitRoot looks like a mock value")
+		/*log.Warnf(
+			"NewLocalExitRoot looks like a mock value, using value from executor instead: %v",
+			proof.InputProver.PublicInputs.NewLocalExitRoot,
+		)*/
+		//resGetProof.Public.PublicInputs.NewLocalExitRoot = proof.InputProver.PublicInputs.NewLocalExitRoot
 	}
+
+	log.Infof("Verfiying final proof with ethereum smart contract, batches %d-%d", proof.BatchNumber, proof.BatchNumberFinal)
+	// · Not working with mock prover _, err = a.Ethman.VerifyBatches2(ctx, proof.BatchNumber-1, proof.BatchNumberFinal, resGetProof, 0, nil, nil)
+	if err != nil {
+		log.Errorf("Error verifiying final proof for batches %d-%d, err: %w", proof.BatchNumber, proof.BatchNumberFinal, err)
+		return err
+	}
+
+	/* · Is needed to do this additional steps??
+	err = c.state.UpdateProofTx(ctx, pendingProof.BatchNumber, tx.Hash(), tx.Nonce(), nil)
+	if err != nil {
+		log.Errorf("failed to update tx to verify batch for batch number %v, new tx hash %v, nonce %v, err: %v",
+			pendingProof.BatchNumber, tx.Hash().String(), tx.Nonce(), err)
+		break
+	}
+	err = c.ethMan.WaitTxToBeMined(ctx, tx, c.cfg.IntervalToReviewVerifyBatchTx.Duration)
+	if err != nil {
+		log.Errorf("error waiting tx to be mined: %s, error: %w", tx.Hash(), err)
+		break
+	}
+	txHash := tx.Hash()
+	pendingProof.TxHash = &txHash
+	nonce := tx.Nonce()
+	pendingProof.TxNonce = &nonce
+	time.Sleep(time.Second * 2) // nolint
+	*/
+
 	log.Infof("Final proof for batches %d-%d verified", proof.BatchNumber, proof.BatchNumberFinal)
 
 	return nil
 }
 
-func (a *AggregatorV2) unlockProofsToAggregate(ctx context.Context, proof1 *state.Proof2, proof2 *state.Proof2) error {
+func (a *AggregatorV2) unlockProofsToAggregate(ctx context.Context, proof1, proof2 *state.RecursiveProof) error {
 	// Release proofs from aggregating state in a single transaction
 	dbTx, err := a.State.BeginStateTransaction(ctx)
 	if err != nil {
@@ -324,16 +369,16 @@ func (a *AggregatorV2) unlockProofsToAggregate(ctx context.Context, proof1 *stat
 		return err
 	}
 
-	proof1.Aggregating = false
-	err = a.State.UpdateGeneratedProof2(ctx, proof1, dbTx)
+	proof1.Generating = false
+	err = a.State.UpdateGeneratedRecursiveProof(ctx, proof1, dbTx)
 	if err != nil {
 		log.Warnf("Failed to release proof aggregation state, err: %v", err)
 		dbTx.Rollback(ctx)
 		return err
 	}
 
-	proof2.Aggregating = false
-	err = a.State.UpdateGeneratedProof2(ctx, proof2, dbTx)
+	proof2.Generating = false
+	err = a.State.UpdateGeneratedRecursiveProof(ctx, proof2, dbTx)
 	if err != nil {
 		log.Warnf("Failed to release proof aggregation state, err: %v", err)
 		dbTx.Rollback(ctx)
@@ -347,7 +392,7 @@ func (a *AggregatorV2) unlockProofsToAggregate(ctx context.Context, proof1 *stat
 	return nil
 }
 
-func (a *AggregatorV2) getAndLockProofsToAggregate(ctx context.Context) (*state.Proof2, *state.Proof2, error) {
+func (a *AggregatorV2) getAndLockProofsToAggregate(ctx context.Context) (*state.RecursiveProof, *state.RecursiveProof, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -358,21 +403,21 @@ func (a *AggregatorV2) getAndLockProofsToAggregate(ctx context.Context) (*state.
 		return nil, nil, err
 	}
 
-	proof1, proof2, err := a.State.GetProofsToAggregate(ctx, nil)
+	proof1, proof2, err := a.State.GetRecursiveProofsToAggregate(ctx, nil)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	proof1.Aggregating = true
-	err = a.State.UpdateGeneratedProof2(ctx, proof1, dbTx)
+	proof1.Generating = true
+	err = a.State.UpdateGeneratedRecursiveProof(ctx, proof1, dbTx)
 	if err != nil {
 		log.Errorf("Failed to set proof aggregation state, err: %v", err)
 		dbTx.Rollback(ctx)
 		return nil, nil, err
 	}
 
-	proof2.Aggregating = true
-	err = a.State.UpdateGeneratedProof2(ctx, proof2, dbTx)
+	proof2.Generating = true
+	err = a.State.UpdateGeneratedRecursiveProof(ctx, proof2, dbTx)
 	if err != nil {
 		log.Errorf("Failed to set proof aggregation state, err: %v", err)
 		dbTx.Rollback(ctx)
@@ -389,7 +434,7 @@ func (a *AggregatorV2) getAndLockProofsToAggregate(ctx context.Context) (*state.
 func (a *AggregatorV2) aggregateProofs(ctx context.Context, prover proverInterface) (ok bool, err error) {
 	log.Debugf("aggregateProofs start %s", prover.ID())
 
-	var proof1, proof2 *state.Proof2
+	var proof1, proof2 *state.RecursiveProof
 
 	proof1, proof2, err = a.getAndLockProofsToAggregate(ctx)
 	if errors.Is(err, state.ErrNotFound) {
@@ -415,12 +460,12 @@ func (a *AggregatorV2) aggregateProofs(ctx context.Context, prover proverInterfa
 
 	proverID := prover.ID()
 
-	aggrProof := &state.Proof2{
+	aggrProof := &state.RecursiveProof{
 		BatchNumber:      proof1.BatchNumber,
 		BatchNumberFinal: proof2.BatchNumberFinal,
 		Prover:           &proverID,
 		InputProver:      proof1.InputProver,
-		Aggregating:      false,
+		Generating:       false,
 	}
 
 	var aggrProofID string
@@ -451,7 +496,7 @@ func (a *AggregatorV2) aggregateProofs(ctx context.Context, prover proverInterfa
 		return false, err
 	}
 
-	err = a.State.AddGeneratedProof2(ctx, aggrProof, dbTx)
+	err = a.State.AddGeneratedRecursiveProof(ctx, aggrProof, dbTx)
 	if err != nil {
 		dbTx.Rollback(ctx)
 		log.Errorf("Failed to store proof aggregation result, err: %v", err)
@@ -459,13 +504,13 @@ func (a *AggregatorV2) aggregateProofs(ctx context.Context, prover proverInterfa
 	}
 
 	// Delete aggregated proofs
-	err = a.State.DeleteGeneratedProof2(ctx, proof1.BatchNumber, proof1.BatchNumberFinal, nil)
+	err = a.State.DeleteGeneratedRecursiveProof(ctx, proof1.BatchNumber, proof1.BatchNumberFinal, nil)
 	if err != nil {
 		dbTx.Rollback(ctx)
 		log.Errorf("Failed to delete aggregation input proof 1: %w", err)
 		return false, err
 	}
-	err = a.State.DeleteGeneratedProof2(ctx, proof2.BatchNumber, proof2.BatchNumberFinal, nil)
+	err = a.State.DeleteGeneratedRecursiveProof(ctx, proof2.BatchNumber, proof2.BatchNumberFinal, nil)
 	if err != nil {
 		dbTx.Rollback(ctx)
 		log.Errorf("Failed to delete aggregation input proof 2: %w", err)
@@ -479,7 +524,7 @@ func (a *AggregatorV2) aggregateProofs(ctx context.Context, prover proverInterfa
 	return true, nil
 }
 
-func (a *AggregatorV2) getAndLockBatchToProve(ctx context.Context, prover proverInterface) (*state.Batch, *state.Proof2, error) {
+func (a *AggregatorV2) getAndLockBatchToProve(ctx context.Context, prover proverInterface) (*state.Batch, *state.RecursiveProof, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -489,7 +534,7 @@ func (a *AggregatorV2) getAndLockBatchToProve(ctx context.Context, prover prover
 	}
 
 	// Get virtual batch pending to generate proof
-	batchToVerify, err := a.State.GetVirtualBatchToProve(ctx, lastVerifiedBatch.BatchNumber, nil)
+	batchToVerify, err := a.State.GetVirtualBatchToRecursiveProve(ctx, lastVerifiedBatch.BatchNumber, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -510,15 +555,15 @@ func (a *AggregatorV2) getAndLockBatchToProve(ctx context.Context, prover prover
 	}
 
 	proverID := prover.ID()
-	proof := &state.Proof2{
+	proof := &state.RecursiveProof{
 		BatchNumber:      batchToVerify.BatchNumber,
 		BatchNumberFinal: batchToVerify.BatchNumber,
 		Prover:           &proverID,
-		Aggregating:      false,
+		Generating:       false,
 	}
 
 	// Avoid other thread to process the same batch
-	err = a.State.AddGeneratedProof2(ctx, proof, nil)
+	err = a.State.AddGeneratedRecursiveProof(ctx, proof, nil)
 	if err != nil {
 		log.Errorf("Failed to add batch proof, err: %v", err)
 		return nil, nil, err
@@ -530,7 +575,7 @@ func (a *AggregatorV2) getAndLockBatchToProve(ctx context.Context, prover prover
 func (a *AggregatorV2) generateProof(ctx context.Context, prover proverInterface) (ok bool, err error) {
 	var (
 		batchToProve *state.Batch
-		proof        *state.Proof2
+		proof        *state.RecursiveProof
 	)
 	batchToProve, proof, err = a.getAndLockBatchToProve(ctx, prover)
 	if errors.Is(err, state.ErrNotFound) {
@@ -544,7 +589,7 @@ func (a *AggregatorV2) generateProof(ctx context.Context, prover proverInterface
 
 	defer func() {
 		if err != nil {
-			err2 := a.State.DeleteGeneratedProof2(ctx, proof.BatchNumber, proof.BatchNumberFinal, nil)
+			err2 := a.State.DeleteGeneratedRecursiveProof(ctx, proof.BatchNumber, proof.BatchNumberFinal, nil)
 			if err2 != nil {
 				log.Errorf("Failed to delete proof in progress, err: %v", err2)
 			}
@@ -554,19 +599,24 @@ func (a *AggregatorV2) generateProof(ctx context.Context, prover proverInterface
 	log.Infof("Prover %s is going to be used for batchNumber: %d", prover.ID(), batchToProve.BatchNumber)
 
 	log.Infof("Sending zki + batch to the prover, batchNumber: %d", batchToProve.BatchNumber)
-	proof.InputProver, err = a.buildInputProver(ctx, batchToProve)
+	inputProver, err := a.buildInputProver(ctx, batchToProve)
 	if err != nil {
 		log.Errorf("Failed to build input prover, err: %v", err)
 		return false, err
 	}
 
-	log.Infof("Sending a batch to the prover, OLDSTATEROOT: %s, BATCHNUM: %d",
-		proof.InputProver.PublicInputs.OldStateRoot, batchToProve.BatchNumber)
-
-	genProofID, err := prover.BatchProof(proof.InputProver)
+	b, err := json.Marshal(inputProver)
 	if err != nil {
-		log.Errorf("Failed instruct prover to prove a batch: %w", err)
-		return false, err
+		return false, fmt.Errorf("Failed serialize input prover, err: %w", err)
+	}
+	proof.InputProver = string(b)
+
+	log.Infof("Sending a batch to the prover, OLDSTATEROOT: %s, OLDBATCHNUM: %d",
+		inputProver.PublicInputs.OldStateRoot, inputProver.PublicInputs.OldBatchNum)
+
+	genProofID, err := prover.BatchProof(inputProver)
+	if err != nil {
+		return false, fmt.Errorf("Failed instruct prover to prove a batch: %w", err)
 	}
 
 	proof.ProofID = &genProofID
@@ -578,7 +628,11 @@ func (a *AggregatorV2) generateProof(ctx context.Context, prover proverInterface
 		log.Errorf("Failed to get proof from prover, err: %v", err)
 		return false, err
 	}
+
+	log.Infof("Batch proof %s generated", *proof.ProofID)
+
 	proof.Proof = resGetProof
+	proof.Generating = false
 
 	// TODO(pg): remove?
 	// a.compareInputHashes(proof.InputProver, proof.Proof)
@@ -595,7 +649,7 @@ func (a *AggregatorV2) generateProof(ctx context.Context, prover proverInterface
 	// }
 
 	// Store proof
-	err = a.State.UpdateGeneratedProof2(ctx, proof, nil)
+	err = a.State.UpdateGeneratedRecursiveProof(ctx, proof, nil)
 	if err != nil {
 		log.Errorf("Failed to store batch proof result, err: %v", err)
 		return false, err
@@ -626,35 +680,35 @@ func (a *AggregatorV2) isSynced(ctx context.Context) bool {
 	return true
 }
 
-func (a *AggregatorV2) buildInputProver(ctx context.Context, batchToVerify *state.Batch) (*pb2.InputProver, error) {
+func (a *AggregatorV2) buildInputProver(ctx context.Context, batchToVerify *state.Batch) (*pb.InputProver, error) {
 	previousBatch, err := a.State.GetBatchByNumber(ctx, batchToVerify.BatchNumber-1, nil)
-	if err != nil && !errors.Is(err, state.ErrStateNotSynchronized) {
-		return nil, fmt.Errorf("Failed to get previous batch, err: %w", err)
+	if err != nil && err != state.ErrStateNotSynchronized {
+		return nil, fmt.Errorf("Failed to get previous batch, err: %v", err)
 	}
 
 	blockTimestampByte := make([]byte, 8) //nolint:gomnd
 	binary.BigEndian.PutUint64(blockTimestampByte, uint64(batchToVerify.Timestamp.Unix()))
-	// batchHashData := common.BytesToHash(keccak256.Hash(
-	// 	batchToVerify.BatchL2Data,
-	// 	batchToVerify.GlobalExitRoot[:],
-	// 	blockTimestampByte,
-	// 	batchToVerify.Coinbase[:],
-	// ))
-	inputProver := &pb2.InputProver{
-		PublicInputs: &pb2.PublicInputs{
+	batchHashData := common.BytesToHash(keccak256.Hash(
+		batchToVerify.BatchL2Data,
+		batchToVerify.GlobalExitRoot[:],
+		blockTimestampByte,
+		batchToVerify.Coinbase[:],
+	))
+	pubAddr, err := a.Ethman.GetPublicAddress()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get public address, err: %w", err)
+	}
+	inputProver := &pb.InputProver{
+		PublicInputs: &pb.PublicInputs{
 			OldStateRoot:    previousBatch.StateRoot.Bytes(),
-			OldAccInputHash: nil, // FIXME(pg)
-			// OldLocalExitRoot: previousBatch.LocalExitRoot.String(),
-			// NewStateRoot:     batchToVerify.StateRoot.String(),
-			// NewLocalExitRoot: batchToVerify.LocalExitRoot.String(),
-			// BatchHashData:    batchHashData.String(),
-			OldBatchNum:    batchToVerify.BatchNumber,
-			ChainId:        a.cfg.ChainID,
-			BatchL2Data:    batchToVerify.BatchL2Data,
-			GlobalExitRoot: batchToVerify.GlobalExitRoot.Bytes(),
-			EthTimestamp:   uint64(batchToVerify.Timestamp.Unix()),
-			SequencerAddr:  batchToVerify.Coinbase.String(),
-			AggregatorAddr: a.Ethman.GetPublicAddress().String(),
+			OldAccInputHash: []byte(batchHashData.String()), //previousBatch.acc_input_hash
+			OldBatchNum:     previousBatch.BatchNumber,
+			ChainId:         a.cfg.ChainID,
+			BatchL2Data:     batchToVerify.BatchL2Data,
+			GlobalExitRoot:  batchToVerify.GlobalExitRoot.Bytes(),
+			EthTimestamp:    uint64(batchToVerify.Timestamp.Unix()),
+			SequencerAddr:   batchToVerify.Coinbase.String(),
+			AggregatorAddr:  pubAddr.String(),
 		},
 		Db:                map[string]string{},
 		ContractsBytecode: map[string]string{},
@@ -663,43 +717,52 @@ func (a *AggregatorV2) buildInputProver(ctx context.Context, batchToVerify *stat
 	return inputProver, nil
 }
 
-func (a *AggregatorV2) compareInputHashes(ip *pb.InputProver, resGetProof *pb.GetProofResponse) {
-	// Calc inputHash
-	batchNumberByte := make([]byte, 4) //nolint:gomnd
-	binary.BigEndian.PutUint32(batchNumberByte, ip.PublicInputs.BatchNum)
-	blockTimestampByte := make([]byte, 8) //nolint:gomnd
-	binary.BigEndian.PutUint64(blockTimestampByte, ip.PublicInputs.EthTimestamp)
-	hash := keccak256.Hash(
-		[]byte(ip.PublicInputs.OldStateRoot)[:],
-		[]byte(ip.PublicInputs.OldLocalExitRoot)[:],
-		[]byte(ip.PublicInputs.NewStateRoot)[:],
-		[]byte(ip.PublicInputs.NewLocalExitRoot)[:],
-		[]byte(ip.PublicInputs.SequencerAddr)[:],
-		[]byte(ip.PublicInputs.BatchHashData)[:],
-		batchNumberByte[:],
-		blockTimestampByte[:],
-	)
-	// Prime field. It is the prime number used as the order in our elliptic curve
-	const fr = "21888242871839275222246405745257275088548364400416034343698204186575808495617"
-	frB, _ := new(big.Int).SetString(fr, encoding.Base10)
-	inputHashMod := new(big.Int).Mod(new(big.Int).SetBytes(hash), frB)
-	internalInputHash := inputHashMod.Bytes()
+func (a *AggregatorV2) compareInputHashes(ip *pb.InputProver, resGetProof *pb.FinalProof) {
+	/*	// Calc inputHash
+		batchNumberByte := make([]byte, 8) //nolint:gomnd
+		binary.BigEndian.PutUint64(batchNumberByte, ip.PublicInputs.OldBatchNum)
+		blockTimestampByte := make([]byte, 8) //nolint:gomnd
+		binary.BigEndian.PutUint64(blockTimestampByte, ip.PublicInputs.EthTimestamp)
+		hash := keccak256.Hash(
+			[]byte(ip.PublicInputs.OldStateRoot)[:],
+			[]byte(ip.PublicInputs.OldLocalExitRoot)[:],
+			[]byte(ip.PublicInputs.NewStateRoot)[:],
+			[]byte(ip.PublicInputs.NewLocalExitRoot)[:],
+			[]byte(ip.PublicInputs.SequencerAddr)[:],
+			[]byte(ip.PublicInputs.BatchHashData)[:],
+			batchNumberByte[:],
+			blockTimestampByte[:],
+		)
+		// Prime field. It is the prime number used as the order in our elliptic curve
+		const fr = "21888242871839275222246405745257275088548364400416034343698204186575808495617"
+		frB, _ := new(big.Int).SetString(fr, encoding.Base10)
+		inputHashMod := new(big.Int).Mod(new(big.Int).SetBytes(hash), frB)
+		internalInputHash := inputHashMod.Bytes()
 
-	// InputHash must match
-	internalInputHashS := fmt.Sprintf("0x%064s", hex.EncodeToString(internalInputHash))
-	publicInputsExtended := resGetProof.GetPublic()
-	if resGetProof.GetPublic().InputHash != internalInputHashS {
-		log.Error("inputHash received from the prover (", publicInputsExtended.InputHash,
-			") doesn't match with the internal value: ", internalInputHashS)
-		log.Debug("internalBatchHashData: ", ip.PublicInputs.BatchHashData, " externalBatchHashData: ", publicInputsExtended.PublicInputs.BatchHashData)
-		log.Debug("inputProver.PublicInputs.OldStateRoot: ", ip.PublicInputs.OldStateRoot)
-		log.Debug("inputProver.PublicInputs.OldLocalExitRoot:", ip.PublicInputs.OldLocalExitRoot)
-		log.Debug("inputProver.PublicInputs.NewStateRoot: ", ip.PublicInputs.NewStateRoot)
-		log.Debug("inputProver.PublicInputs.NewLocalExitRoot: ", ip.PublicInputs.NewLocalExitRoot)
-		log.Debug("inputProver.PublicInputs.SequencerAddr: ", ip.PublicInputs.SequencerAddr)
-		log.Debug("inputProver.PublicInputs.BatchHashData: ", ip.PublicInputs.BatchHashData)
-		log.Debug("inputProver.PublicInputs.BatchNum: ", ip.PublicInputs.BatchNum)
-		log.Debug("inputProver.PublicInputs.EthTimestamp: ", ip.PublicInputs.EthTimestamp)
+		// InputHash must match
+		internalInputHashS := fmt.Sprintf("0x%064s", hex.EncodeToString(internalInputHash))
+		publicInputsExtended := resGetProof.GetPublic()
+		if resGetProof.GetPublic().InputHash != internalInputHashS {
+			log.Error("inputHash received from the prover (", publicInputsExtended.InputHash,
+				") doesn't match with the internal value: ", internalInputHashS)
+			log.Debug("internalBatchHashData: ", ip.PublicInputs.BatchHashData, " externalBatchHashData: ", publicInputsExtended.PublicInputs.BatchHashData)
+			log.Debug("inputProver.PublicInputs.OldStateRoot: ", ip.PublicInputs.OldStateRoot)
+			log.Debug("inputProver.PublicInputs.OldLocalExitRoot:", ip.PublicInputs.OldLocalExitRoot)
+			log.Debug("inputProver.PublicInputs.NewStateRoot: ", ip.PublicInputs.NewStateRoot)
+			log.Debug("inputProver.PublicInputs.NewLocalExitRoot: ", ip.PublicInputs.NewLocalExitRoot)
+			log.Debug("inputProver.PublicInputs.SequencerAddr: ", ip.PublicInputs.SequencerAddr)
+			log.Debug("inputProver.PublicInputs.BatchHashData: ", ip.PublicInputs.BatchHashData)
+			log.Debug("inputProver.PublicInputs.BatchNum: ", ip.PublicInputs.BatchNum)
+			log.Debug("inputProver.PublicInputs.EthTimestamp: ", ip.PublicInputs.EthTimestamp)
+		}*/
+}
+
+func waitTick(ctx context.Context, ticker *time.Ticker) {
+	select {
+	case <-ticker.C:
+		// nothing
+	case <-ctx.Done():
+		return
 	}
 }
 

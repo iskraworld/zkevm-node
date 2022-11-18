@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 
 	"github.com/0xPolygonHermez/zkevm-node/aggregator"
-	aggregator2 "github.com/0xPolygonHermez/zkevm-node/aggregator2"
+	aggregator2 "github.com/0xPolygonHermez/zkevm-node/aggregator_v2"
 	"github.com/0xPolygonHermez/zkevm-node/config"
 	"github.com/0xPolygonHermez/zkevm-node/db"
 	"github.com/0xPolygonHermez/zkevm-node/etherman"
@@ -72,7 +72,7 @@ func start(cliCtx *cli.Context) error {
 		log.Fatal(err)
 	}
 	c.Aggregator.ChainID = l2ChainID
-	c.Aggregator2.ChainID = l2ChainID
+	c.AggregatorV2.ChainID = l2ChainID
 	c.RPC.ChainID = l2ChainID
 	log.Infof("Chain ID read from POE SC = %v", l2ChainID)
 
@@ -89,8 +89,7 @@ func start(cliCtx *cli.Context) error {
 			go runAggregator(ctx, c.Aggregator, etherman, ethTxManager, st, grpcClientConns)
 		case AGGREGATOR2:
 			log.Info("Running aggregator2")
-			c.Aggregator2.ProverURIs = c.Provers.ProverURIs
-			go runAggregator2(ctx, c.Aggregator2, etherman, ethTxManager, st)
+			go runAggregator2(ctx, c.AggregatorV2, etherman, ethTxManager, st)
 		case SEQUENCER:
 			log.Info("Running sequencer")
 			poolInstance := createPool(c.PoolDB, c.NetworkConfig.L2BridgeAddr, l2ChainID, st)

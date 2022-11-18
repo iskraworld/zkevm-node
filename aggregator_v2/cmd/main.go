@@ -8,7 +8,6 @@ import (
 
 	aggregator2 "github.com/0xPolygonHermez/zkevm-node/aggregator_v2"
 	"github.com/0xPolygonHermez/zkevm-node/aggregator_v2/pb"
-	"github.com/0xPolygonHermez/zkevm-node/aggregator_v2/prover"
 	"github.com/0xPolygonHermez/zkevm-node/config/types"
 	"github.com/0xPolygonHermez/zkevm-node/log"
 	"google.golang.org/grpc"
@@ -20,14 +19,14 @@ func main() {
 		Host:                       "0.0.0.0",
 		Port:                       8888,
 		IntervalToConsolidateState: types.NewDuration(time.Second),
-		Prover: prover.Config{
-			IntervalFrequencyToGetProofGenerationState: types.NewDuration(5 * time.Second),
-		},
 	}
 	ctx := context.Background()
 
-	a := aggregator2.New(&cfg)
-	a.Start()
+	srv, err := aggregator2.New(cfg, nil, nil, nil)
+	if err != nil {
+		panic(err)
+	}
+	srv.Start(ctx)
 
 	// connect
 	opts := []grpc.DialOption{

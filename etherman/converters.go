@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"math/big"
 
-	pb2 "github.com/0xPolygonHermez/zkevm-node/aggregator2/pb"
+	pb2 "github.com/0xPolygonHermez/zkevm-node/aggregator_v2/pb"
 	"github.com/0xPolygonHermez/zkevm-node/encoding"
 	"github.com/0xPolygonHermez/zkevm-node/hex"
 	"github.com/0xPolygonHermez/zkevm-node/proverclient/pb"
