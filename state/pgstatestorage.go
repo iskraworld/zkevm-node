@@ -1863,7 +1863,8 @@ func (p *PostgresStorage) GetVirtualBatchToRecursiveProve(ctx context.Context, l
 			b.state_root,
 			b.timestamp,
 			b.coinbase,
-			b.raw_txs_data
+			b.raw_txs_data,
+			b.acc_input_hash
 		FROM
 			state.batch b,
 			state.virtual_batch v
@@ -1878,7 +1879,6 @@ func (p *PostgresStorage) GetVirtualBatchToRecursiveProve(ctx context.Context, l
 	e := p.getExecQuerier(dbTx)
 	row := e.QueryRow(ctx, query, lastVerfiedBatchNumber)
 	batch, err := scanBatch(row)
-
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	} else if err != nil {
