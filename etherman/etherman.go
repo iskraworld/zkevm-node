@@ -842,8 +842,8 @@ func (etherMan *Client) getGasPrice(ctx context.Context) *big.Int {
 	return gasPrice
 }
 
-// VerifyBatches2 send verifyBatches2 request to the ethereum
-func (etherMan *Client) VerifyBatches2(ctx context.Context, lastVerifiedBatch, newVerifiedBatch uint64, resGetProof *pb2.GetProofResponse_FinalProof, gasLimit uint64, gasPrice, nonce *big.Int) (*types.Transaction, error) {
+// SendFinalProof send verifyBatches2 request to the ethereum
+func (etherMan *Client) SendFinalProof(ctx context.Context, lastVerifiedBatch, newVerifiedBatch uint64, resGetProof *pb2.FinalProof, gasLimit uint64, gasPrice, nonce *big.Int) (*types.Transaction, error) {
 	if etherMan.IsReadOnly() {
 		return nil, ErrIsReadOnlyMode
 	}
@@ -857,12 +857,12 @@ func (etherMan *Client) VerifyBatches2(ctx context.Context, lastVerifiedBatch, n
 	if nonce != nil {
 		verifyBatchOpts.Nonce = nonce
 	}
-	return etherMan.verifyBatches2(&verifyBatchOpts, lastVerifiedBatch, newVerifiedBatch, resGetProof)
+	return etherMan.sendFinalProof(&verifyBatchOpts, lastVerifiedBatch, newVerifiedBatch, resGetProof)
 }
 
-// verifyBatches2 function allows the aggregator send the proof for a batch and consolidate it
-func (etherMan *Client) verifyBatches2(opts *bind.TransactOpts, lastVerifiedBatch, newVerifiedBatch uint64, resGetProof *pb2.GetProofResponse_FinalProof) (*types.Transaction, error) {
-	publicInputs := resGetProof.FinalProof.Public
+// sendFinalProof function allows the aggregator send the proof for a batch and consolidate it
+func (etherMan *Client) sendFinalProof(opts *bind.TransactOpts, lastVerifiedBatch, newVerifiedBatch uint64, finalProof *pb2.FinalProof) (*types.Transaction, error) {
+	publicInputs := finalProof.Public
 
 	var newLocalExitRoot [32]byte
 	copy(newLocalExitRoot[:], publicInputs.NewLocalExitRoot)
@@ -870,15 +870,15 @@ func (etherMan *Client) verifyBatches2(opts *bind.TransactOpts, lastVerifiedBatc
 	var newStateRoot [32]byte
 	copy(newStateRoot[:], publicInputs.NewStateRoot)
 
-	proofA, err := strSliceToBigIntArray(resGetProof.FinalProof.Proof.ProofA)
+	proofA, err := strSliceToBigIntArray(finalProof.Proof.ProofA)
 	if err != nil {
 		return nil, err
 	}
-	proofB, err := proofSlcToIntArray2(resGetProof.FinalProof.Proof.ProofB)
+	proofB, err := proofSlcToIntArray2(finalProof.Proof.ProofB)
 	if err != nil {
 		return nil, err
 	}
-	proofC, err := strSliceToBigIntArray(resGetProof.FinalProof.Proof.ProofC)
+	proofC, err := strSliceToBigIntArray(finalProof.Proof.ProofC)
 	if err != nil {
 		return nil, err
 	}

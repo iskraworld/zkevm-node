@@ -30,7 +30,7 @@ type ethTxManager interface {
 
 // etherman contains the methods required to interact with ethereum
 type etherman interface {
-	VerifyBatches2(ctx context.Context, lastVerifiedBatch, newVerifiedBatch uint64, resGetProof *pb.GetProofResponse_FinalProof, gasLimit uint64, gasPrice, nonce *big.Int) (*types.Transaction, error)
+	SendFinalProof(ctx context.Context, lastVerifiedBatch, newVerifiedBatch uint64, resGetProof *pb.FinalProof, gasLimit uint64, gasPrice, nonce *big.Int) (*types.Transaction, error)
 	GetLatestVerifiedBatchNum() (uint64, error)
 	GetPublicAddress() (common.Address, error)
 }

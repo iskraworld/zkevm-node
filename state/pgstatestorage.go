@@ -1860,11 +1860,11 @@ func (p *PostgresStorage) GetVirtualBatchToRecursiveProve(ctx context.Context, l
 			b.batch_num,
 			b.global_exit_root,
 			b.local_exit_root,
+			b.acc_input_hash,
 			b.state_root,
 			b.timestamp,
 			b.coinbase,
-			b.raw_txs_data,
-			b.acc_input_hash
+			b.raw_txs_data
 		FROM
 			state.batch b,
 			state.virtual_batch v
